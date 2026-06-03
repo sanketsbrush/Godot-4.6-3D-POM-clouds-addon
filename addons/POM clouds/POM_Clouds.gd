@@ -53,8 +53,3 @@ func do_POM():
 		multimesh.set_instance_transform(i,Transform3D(Basis(),Vector3()))
 		var instance_alpha = float(i)/float(POM_layers)
 		multimesh.set_instance_color( i,Color(instance_alpha,instance_alpha,instance_alpha,instance_alpha))
-
-
-#func cam_location():
-	#if Engine.is_editor_hint() : return (EditorInterface.get_editor_viewport_3d(0).get_camera_3d().global_position)
-	#else : return (get_viewport().get_camera_3d().global_position)

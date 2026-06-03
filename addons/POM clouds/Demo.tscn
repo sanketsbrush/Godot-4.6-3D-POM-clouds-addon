@@ -1,0 +1,553 @@
+[gd_scene format=3 uid="uid://b6yv7mmupvgeb"]
+
+[ext_resource type="Texture2D" uid="uid://dypk48ldtik6s" path="res://addons/POM clouds/icon.svg" id="1_gk6mi"]
+[ext_resource type="Shader" uid="uid://bncptpdni6rti" path="res://addons/POM clouds/POM_Clouds_shader.tres" id="1_jvqbo"]
+[ext_resource type="Script" uid="uid://ut2sokhl7u7c" path="res://addons/POM clouds/POM_Clouds.gd" id="2_gk6mi"]
+
+[sub_resource type="Shader" id="Shader_l3oyd"]
+code = "shader_type sky;
+
+const float EPS = 1e-6;
+const float INFINITY = 1.0 / 0.0;
+const float PLANET_RADIUS = 6371000.0;
+const vec3 PLANET_CENTER = vec3(0.0, -PLANET_RADIUS, 0.0);
+const float ATMOSPHERE_HEIGHT = 100000.0;
+const float RAYLEIGH_HEIGHT = (ATMOSPHERE_HEIGHT * 0.08);
+const float MIE_HEIGHT = (ATMOSPHERE_HEIGHT * 0.012);
+
+uniform float rayleigh_strength : hint_range(0.0, 5.0) = 1.0;
+uniform float mie_strength      : hint_range(0.0, 5.0) = 1.0;
+uniform float ozone_strength    : hint_range(0.0, 5.0) = 1.0;
+
+const vec3 C_RAYLEIGH = vec3(5.802, 13.558, 33.100) * 1e-6;
+const vec3 C_MIE = vec3(3.996,  3.996,  3.996) * 1e-6;
+const vec3 C_OZONE = vec3(0.650,  1.881,  0.085) * 1e-6;
+
+uniform float atmosphere_density: hint_range(0.0, 5.0) = 1.0;
+uniform float exposure = 10.0;
+
+uniform float sun_disc_feather: hint_range(0.0, 0.5) = 0.1;
+uniform float sundisc_intensity = 10.0;
+
+uniform bool use_debanding = true;
+
+#define saturate(a) clamp(a, 0.0, 1.0)
+
+vec2 sphere_intersection (vec3 rayStart, vec3 rayDir, vec3 sphereCenter, float sphereRadius)
+{
+	rayStart -= sphereCenter;
+	float a = dot(rayDir, rayDir);
+	float b = 2.0 * dot(rayStart, rayDir);
+	float c = dot(rayStart, rayStart) - (sphereRadius * sphereRadius);
+	float d = b * b - 4.0 * a * c;
+	if (d < 0.0)
+	{
+		return vec2(-1.0);
+	}
+	else
+	{
+		d = sqrt(d);
+		return vec2(-b - d, -b + d) / (2.0 * a);
+	}
+}
+
+vec2 planet_intersection (vec3 rayStart, vec3 rayDir)
+{
+	return sphere_intersection(rayStart, rayDir, PLANET_CENTER, PLANET_RADIUS);
+}
+
+vec2 atmosphere_intersection (vec3 rayStart, vec3 rayDir)
+{
+	return sphere_intersection(rayStart, rayDir, PLANET_CENTER, PLANET_RADIUS + ATMOSPHERE_HEIGHT);
+}
+
+float phase_rayleigh (float costh)
+{
+	return 3.0 * (1.0 + costh*costh) / (16.0 * PI);
+}
+
+float phase_mie (float costh, float g)
+{
+	g = min(g, 0.9381);
+	float k = 1.55*g - 0.55*g*g*g;
+	float kcosth = k*costh;
+	return (1.0 - k*k) / ((4.0 * PI) * (1.0-kcosth) * (1.0-kcosth));
+}
+
+float atmosphere_height (vec3 position_world_space) {
+	return distance(position_world_space, PLANET_CENTER) - PLANET_RADIUS;
+}
+float density_rayleigh (float h) {
+	return exp(-max(0.0, h / RAYLEIGH_HEIGHT));
+}
+float density_mie (float h) {
+	return exp(-max(0.0, h / MIE_HEIGHT));
+}
+float density_ozone (float h) {
+	return max(0.0, 1.0 - abs(h - 25000.0) / 15000.0);
+}
+vec3 density_atmosphere (float h) {
+	return vec3(density_rayleigh(h), density_mie(h), density_ozone(h));
+}
+
+vec3 integrate_optical_depth (vec3 rayStart, vec3 rayDir)
+{
+	vec2 intersection = atmosphere_intersection(rayStart, rayDir);
+	float  rayLength    = intersection.y;
+
+	int    sampleCount  = 8;
+	float  stepSize     = rayLength / float(sampleCount);
+	
+	vec3 opticalDepth = vec3(0.0);
+
+	for (int i = 0; i < sampleCount; i++)
+	{
+		vec3 localPosition = rayStart + rayDir * (float(i) + 0.5) * stepSize;
+		float localHeight  = atmosphere_height(localPosition);
+		vec3 localDensity  = density_atmosphere(localHeight);
+
+		opticalDepth += localDensity * stepSize;
+	}
+
+	return opticalDepth;
+}
+
+vec3 absorb (vec3 opticalDepth) {
+	return exp(-(
+		opticalDepth.x * C_RAYLEIGH * rayleigh_strength + 
+		opticalDepth.y * C_MIE * mie_strength * 1.1 + 
+		opticalDepth.z * C_OZONE * ozone_strength
+	) * atmosphere_density);
+}
+
+vec3 integrate_scattering (vec3 rayStart, vec3 rayDir, float rayLength, vec3 lightDir, vec3 lightColor, out vec3 transmittance)
+{
+	float  rayHeight = atmosphere_height(rayStart);
+	float  sampleDistributionExponent = 1.0 + saturate(1.0 - rayHeight / ATMOSPHERE_HEIGHT) * 8.0; // Slightly arbitrary max exponent of 9
+
+	vec2 intersection = atmosphere_intersection(rayStart, rayDir);
+	rayLength = min(rayLength, intersection.y);
+	if (intersection.x > 0.0)
+	{
+		rayStart += rayDir * intersection.x;
+		rayLength -= intersection.x;
+	}
+
+	float  costh    = dot(rayDir, lightDir);
+	float  phaseR   = phase_rayleigh(costh);
+	float  phaseM   = phase_mie(costh, 0.85);
+
+	int    sampleCount  = 64;
+
+	vec3 opticalDepth = vec3(0.0);
+	vec3 rayleigh     = vec3(0.0);
+	vec3 mie          = vec3(0.0);
+
+	float  prevRayTime  = 0.0;
+
+	for (int i = 0; i < sampleCount; i++)
+	{
+		float  rayTime = pow(float(i) / float(sampleCount), sampleDistributionExponent) * rayLength;
+		float  stepSize = (rayTime - prevRayTime);
+
+		vec3 localPosition = rayStart + rayDir * rayTime;
+		float  localHeight   = atmosphere_height(localPosition);
+		vec3 localDensity  = density_atmosphere(localHeight);
+
+		opticalDepth += localDensity * stepSize;
+
+		vec3 viewTransmittance = absorb(opticalDepth);
+
+		vec3 opticalDepthlight  = integrate_optical_depth(localPosition, lightDir);
+		vec3 lightTransmittance = absorb(opticalDepthlight);
+
+		rayleigh += viewTransmittance * lightTransmittance * phaseR * localDensity.x * stepSize;
+		mie      += viewTransmittance * lightTransmittance * phaseM * localDensity.y * stepSize;
+
+		prevRayTime = rayTime;
+	}
+
+	transmittance = absorb(opticalDepth);
+
+	return (rayleigh * C_RAYLEIGH * rayleigh_strength + mie * C_MIE * mie_strength) * lightColor * exposure;
+}
+
+float sun_disc(vec3 eyedir, vec3 sundir, float theta_r) {
+	float cos_angle = dot(eyedir, sundir);
+	float cos_inner = cos(theta_r * (1.0 - sun_disc_feather));
+	float cos_outer = cos(theta_r * (1.0 + sun_disc_feather));
+	return smoothstep(cos_outer, cos_inner, cos_angle);
+}
+
+float rand(vec2 co){
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void sky() {
+	vec3 transmittance;
+	vec3 radiance = integrate_scattering(vec3(0.0), EYEDIR, INFINITY, LIGHT0_DIRECTION, vec3(1.0, 0.996, 0.98), transmittance);
+	
+	float sun_mask = sun_disc(EYEDIR, LIGHT0_DIRECTION, LIGHT0_SIZE * 0.5);
+	vec3 sundisc = vec3(sun_mask) * transmittance * sundisc_intensity;
+	
+	COLOR = radiance + sundisc;
+	
+	if (use_debanding) {
+		COLOR += (rand(SKY_COORDS) - 0.5) * 0.001;
+	}
+}"
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_7bi4k"]
+shader = SubResource("Shader_l3oyd")
+shader_parameter/rayleigh_strength = 1.0
+shader_parameter/mie_strength = 1.0
+shader_parameter/ozone_strength = 1.0
+shader_parameter/atmosphere_density = 1.0
+shader_parameter/exposure = 10.0
+shader_parameter/sun_disc_feather = 0.1
+shader_parameter/sundisc_intensity = 10.0
+shader_parameter/use_debanding = true
+
+[sub_resource type="Sky" id="Sky_3t1v7"]
+sky_material = SubResource("ShaderMaterial_7bi4k")
+process_mode = 3
+radiance_size = 0
+
+[sub_resource type="Environment" id="Environment_7laly"]
+background_mode = 2
+sky = SubResource("Sky_3t1v7")
+ssao_enabled = true
+ssao_light_affect = 1.0
+volumetric_fog_density = 0.01
+
+[sub_resource type="GDScript" id="GDScript_q3f68"]
+resource_name = "lit"
+script/source = "@tool
+extends DirectionalLight3D
+@export var cycle:bool
+@export_range(0.0,0.2,0.001)var speed=0.01
+
+func kelvin_to_rgb(temp_kelvin: float) -> Color:
+	var temperature = temp_kelvin / 100.0
+
+	var red: float
+	var green: float
+	var blue: float
+
+	# Calculate red
+	if temperature <= 66.0:
+		red = 255.0
+	else:
+		red = temperature - 60.0
+		red = 329.698727446 * pow(red, -0.1332047592)
+		red = clamp(red, 0.0, 255.0)
+
+	# Calculate green
+	if temperature <= 66.0:
+		green = 99.4708025861 * log(temperature) - 161.1195681661
+		green = clamp(green, 0.0, 255.0)
+	else:
+		green = temperature - 60.0
+		green = 288.1221695283 * pow(green, -0.0755148492)
+		green = clamp(green, 0.0, 255.0)
+
+	# Calculate blue
+	if temperature >= 66.0:
+		blue = 255.0
+	elif temperature <= 19.0:
+		blue = 0.0
+	else:
+		blue = temperature - 10.0
+		blue = 138.5177312231 * log(blue) - 305.0447927307
+		blue = clamp(blue, 0.0, 255.0)
+
+	# Convert to normalized RGB (0.0 to 1.0)
+	return Color(red / 255.0, green / 255.0, blue / 255.0)
+
+func sun_dir_ray() -> Vector3:
+	return global_basis.z.normalized()
+
+func _process(delta: float) -> void:
+	# Transform the light
+	if cycle:
+		rotate_y(delta * -speed)
+		rotate_x(delta * -speed)
+		if light_energy==0:rotation=Vector3()
+	
+	# Update color
+	var weight: float = sun_dir_ray().dot(Vector3.UP)
+	var energy = smoothstep(-0.1, -0.05, weight)
+	weight = pow(clamp(weight, 0.0, 1.0), 0.5)
+	var sun_color = kelvin_to_rgb(lerpf(2000, 6500, weight))
+	light_color = sun_color
+	light_energy = energy
+"
+
+[sub_resource type="WorldBoundaryShape3D" id="WorldBoundaryShape3D_l3oyd"]
+
+[sub_resource type="Gradient" id="Gradient_kelsx"]
+interpolation_mode = 1
+offsets = PackedFloat32Array(0.67840374, 1)
+colors = PackedColorArray(1, 1, 1, 1, 0.728822, 0.72882193, 0.7288221, 1)
+
+[sub_resource type="GradientTexture2D" id="GradientTexture2D_u28ba"]
+gradient = SubResource("Gradient_kelsx")
+fill = 2
+fill_from = Vector2(0.5, 0.5)
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_lw1qo"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeUVFunc" id="VisualShaderNodeUVFunc_vtk2e"]
+default_input_values = [1, Vector2(100, 100), 2, Vector2(0, 0)]
+function = 1
+
+[sub_resource type="VisualShaderNodeFloatOp" id="VisualShaderNodeFloatOp_4n7tc"]
+operator = 2
+
+[sub_resource type="VisualShaderNodeFloatOp" id="VisualShaderNodeFloatOp_1mko0"]
+operator = 2
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_kelsx"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_u28ba"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeUVFunc" id="VisualShaderNodeUVFunc_lw1qo"]
+default_input_values = [1, Vector2(10, 10), 2, Vector2(0, 0)]
+function = 1
+
+[sub_resource type="VisualShaderNodeFloatOp" id="VisualShaderNodeFloatOp_vtk2e"]
+operator = 2
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_ha14x"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeFloatOp" id="VisualShaderNodeFloatOp_ucxga"]
+operator = 2
+
+[sub_resource type="VisualShaderNodeFloatOp" id="VisualShaderNodeFloatOp_ha14x"]
+operator = 2
+
+[sub_resource type="VisualShaderNodeUVFunc" id="VisualShaderNodeUVFunc_x4ym5"]
+default_input_values = [1, Vector2(10000, 10000), 2, Vector2(0, 0)]
+function = 1
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_hbi7e"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeUVFunc" id="VisualShaderNodeUVFunc_le6xg"]
+default_input_values = [1, Vector2(100000, 100000), 2, Vector2(0, 0)]
+function = 1
+
+[sub_resource type="VisualShaderNodeTexture" id="VisualShaderNodeTexture_ga7lx"]
+texture = SubResource("GradientTexture2D_u28ba")
+
+[sub_resource type="VisualShaderNodeUVFunc" id="VisualShaderNodeUVFunc_ih3b8"]
+default_input_values = [1, Vector2(1000, 1000), 2, Vector2(0, 0)]
+function = 1
+
+[sub_resource type="VisualShader" id="VisualShader_25ss4"]
+nodes/fragment/0/position = Vector2(580, 160)
+nodes/fragment/2/node = SubResource("VisualShaderNodeTexture_ha14x")
+nodes/fragment/2/position = Vector2(-400, 740)
+nodes/fragment/3/node = SubResource("VisualShaderNodeUVFunc_x4ym5")
+nodes/fragment/3/position = Vector2(-640, 740)
+nodes/fragment/4/node = SubResource("VisualShaderNodeTexture_hbi7e")
+nodes/fragment/4/position = Vector2(-400, 1040)
+nodes/fragment/5/node = SubResource("VisualShaderNodeUVFunc_le6xg")
+nodes/fragment/5/position = Vector2(-660, 1040)
+nodes/fragment/7/node = SubResource("VisualShaderNodeTexture_ga7lx")
+nodes/fragment/7/position = Vector2(-400, 440)
+nodes/fragment/8/node = SubResource("VisualShaderNodeUVFunc_ih3b8")
+nodes/fragment/8/position = Vector2(-640, 440)
+nodes/fragment/10/node = SubResource("VisualShaderNodeTexture_lw1qo")
+nodes/fragment/10/position = Vector2(-400, 140)
+nodes/fragment/11/node = SubResource("VisualShaderNodeUVFunc_vtk2e")
+nodes/fragment/11/position = Vector2(-640, 140)
+nodes/fragment/12/node = SubResource("VisualShaderNodeFloatOp_4n7tc")
+nodes/fragment/12/position = Vector2(-220, 380)
+nodes/fragment/14/node = SubResource("VisualShaderNodeFloatOp_1mko0")
+nodes/fragment/14/position = Vector2(-220, 1000)
+nodes/fragment/15/node = SubResource("VisualShaderNodeTexture_kelsx")
+nodes/fragment/15/position = Vector2(-460, -200)
+nodes/fragment/16/node = SubResource("VisualShaderNodeTexture_u28ba")
+nodes/fragment/16/position = Vector2(-400, -500)
+nodes/fragment/18/node = SubResource("VisualShaderNodeUVFunc_lw1qo")
+nodes/fragment/18/position = Vector2(-640, -500)
+nodes/fragment/19/node = SubResource("VisualShaderNodeFloatOp_vtk2e")
+nodes/fragment/19/position = Vector2(-220, -260)
+nodes/fragment/20/node = SubResource("VisualShaderNodeFloatOp_ucxga")
+nodes/fragment/20/position = Vector2(-40, 20)
+nodes/fragment/21/node = SubResource("VisualShaderNodeFloatOp_ha14x")
+nodes/fragment/21/position = Vector2(140, 560)
+nodes/fragment/connections = PackedInt32Array(3, 0, 2, 0, 5, 0, 4, 0, 8, 0, 7, 0, 11, 0, 10, 0, 10, 0, 12, 0, 7, 0, 12, 1, 4, 0, 14, 1, 2, 0, 14, 0, 18, 0, 16, 0, 16, 0, 19, 0, 15, 0, 19, 1, 19, 0, 20, 0, 12, 0, 20, 1, 20, 0, 21, 0, 14, 0, 21, 1, 21, 0, 0, 0)
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_pr33n"]
+render_priority = 0
+shader = SubResource("VisualShader_25ss4")
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_7bi4k"]
+size = Vector2(100000, 100000)
+
+[sub_resource type="CylinderShape3D" id="CylinderShape3D_7bi4k"]
+height = 8000.0
+radius = 99.0
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_l3oyd"]
+albedo_color = Color(0.84240925, 0.34331083, 0.34253114, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_l3oyd"]
+material = SubResource("StandardMaterial3D_l3oyd")
+top_radius = 99.0
+bottom_radius = 99.0
+height = 8000.0
+radial_segments = 32
+cap_bottom = false
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_l3oyd"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_gs0td"]
+albedo_texture = ExtResource("1_gk6mi")
+uv1_offset = Vector3(0.5, 0.5, 0.5)
+uv1_triplanar = true
+
+[sub_resource type="BoxMesh" id="BoxMesh_7bi4k"]
+
+[sub_resource type="Gradient" id="Gradient_gk6mi"]
+interpolation_mode = 2
+colors = PackedColorArray(1, 1, 1, 1, 0.25929365, 0.25929376, 0.25929332, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_mnpkm"]
+gradient = SubResource("Gradient_gk6mi")
+width = 100
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_gs0td"]
+noise_type = 3
+fractal_type = 3
+
+[sub_resource type="NoiseTexture2D" id="NoiseTexture2D_gtxku"]
+width = 500
+height = 500
+noise = SubResource("FastNoiseLite_gs0td")
+seamless = true
+
+[sub_resource type="Gradient" id="Gradient_pwv3a"]
+interpolation_mode = 2
+offsets = PackedFloat32Array(0, 0.7192308, 1)
+colors = PackedColorArray(0.9297158, 0.9297143, 0.9297147, 1, 1, 1, 1, 1, 0.9297158, 0.9297143, 0.9297147, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_0pmvg"]
+gradient = SubResource("Gradient_pwv3a")
+width = 10
+
+[sub_resource type="Gradient" id="Gradient_eo34b"]
+colors = PackedColorArray(1, 1, 1, 1, 0, 0, 0, 1)
+
+[sub_resource type="GradientTexture2D" id="GradientTexture2D_sqyt5"]
+gradient = SubResource("Gradient_eo34b")
+width = 16
+height = 16
+fill = 1
+fill_from = Vector2(0.5, 0.5)
+fill_to = Vector2(1, 0.5)
+
+[sub_resource type="Gradient" id="Gradient_2wg0x"]
+interpolation_mode = 2
+offsets = PackedFloat32Array(0.68846154, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_b4ypp"]
+gradient = SubResource("Gradient_2wg0x")
+width = 10
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_ott2l"]
+render_priority = 0
+shader = ExtResource("1_jvqbo")
+shader_parameter/layer_gap = 0.017
+shader_parameter/far_cloud_fade_Gradient_2D = SubResource("GradientTexture2D_sqyt5")
+shader_parameter/cloud_vertical_shape_Gradient_1D = SubResource("GradientTexture1D_0pmvg")
+shader_parameter/uv_scale = 1.0
+shader_parameter/mesh_scale = 100000.0
+shader_parameter/wind_resistance = 100.0
+shader_parameter/cloud_Noise_texture_2D = SubResource("NoiseTexture2D_gtxku")
+shader_parameter/horizontal_expantion_Gradient_1D = SubResource("GradientTexture1D_b4ypp")
+shader_parameter/backlight_Gradient_1D = SubResource("GradientTexture1D_mnpkm")
+shader_parameter/triplanar_scale = Vector3(1, 1, 1)
+shader_parameter/triplanar_offset = Vector3(0, 0, 0)
+shader_parameter/triplanar_sharpness = 0.5
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_gk6mi"]
+size = Vector2(1, 1)
+subdivide_width = 10
+subdivide_depth = 10
+
+[sub_resource type="MultiMesh" id="MultiMesh_gs0td"]
+transform_format = 1
+use_colors = true
+instance_count = 8
+mesh = SubResource("PlaneMesh_gk6mi")
+buffer = PackedFloat32Array(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.125, 0.125, 0.125, 0.125, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.25, 0.25, 0.25, 0.25, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.375, 0.375, 0.375, 0.375, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.5, 0.5, 0.5, 0.5, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.625, 0.625, 0.625, 0.625, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.75, 0.75, 0.75, 0.75, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.875, 0.875, 0.875, 0.875)
+
+[node name="Node" type="Node" unique_id=1491412697]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=486101158]
+environment = SubResource("Environment_7laly")
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=2145943943]
+transform = Transform3D(0.8588084, 0.13991828, -0.49258894, 0.14241205, 0.8586362, 0.49217027, 0.49187943, -0.49288794, 0.7175515, 0, 0, 0)
+top_level = true
+light_color = Color(1, 0.9062389, 0.8285042, 1)
+shadow_enabled = true
+shadow_bias = 0.07
+shadow_normal_bias = 3.0
+shadow_opacity = 0.5
+shadow_blur = 0.925
+directional_shadow_split_1 = 0.001
+directional_shadow_split_2 = 0.01
+directional_shadow_split_3 = 0.1
+directional_shadow_max_distance = 10000.0
+script = SubResource("GDScript_q3f68")
+speed = 0.1
+
+[node name="StaticBody3D" type="StaticBody3D" parent="." unique_id=1271604252]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1, 0, 0)
+
+[node name="land col" type="CollisionShape3D" parent="StaticBody3D" unique_id=1501622943]
+shape = SubResource("WorldBoundaryShape3D_l3oyd")
+
+[node name="land mesh" type="MeshInstance3D" parent="StaticBody3D/land col" unique_id=1477466719]
+transform = Transform3D(1, 0, 0, 0, 100, 0, 0, 0, 1, 0.0073633194, 0, 0.003035307)
+material_override = SubResource("ShaderMaterial_pr33n")
+cast_shadow = 0
+mesh = SubResource("PlaneMesh_7bi4k")
+
+[node name="tube" type="CollisionShape3D" parent="StaticBody3D" unique_id=252255949]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 300, 4000, 0)
+shape = SubResource("CylinderShape3D_7bi4k")
+
+[node name="tube mesh" type="MeshInstance3D" parent="StaticBody3D/tube" unique_id=878797159]
+mesh = SubResource("CylinderMesh_l3oyd")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="StaticBody3D" unique_id=831987441]
+transform = Transform3D(0.9241331, 0, 0.3820706, 0, 1, 0, -0.3820706, 0, 0.9241331, -1.289325, 0.5, 0)
+shape = SubResource("BoxShape3D_l3oyd")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="StaticBody3D/CollisionShape3D" unique_id=1326034179]
+rotation_edit_mode = 2
+material_override = SubResource("StandardMaterial3D_gs0td")
+mesh = SubResource("BoxMesh_7bi4k")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=311150111]
+near = 0.1
+far = 1000000.0
+
+[node name="POM_Clouds2" type="MultiMeshInstance3D" parent="." unique_id=1101676642]
+transform = Transform3D(100000, 0, 0, 0, 100000, 0, 0, 0, 100000, 0.7067447, 6000, 2.950791)
+top_level = true
+material_override = SubResource("ShaderMaterial_ott2l")
+cast_shadow = 0
+multimesh = SubResource("MultiMesh_gs0td")
+script = ExtResource("2_gk6mi")
+POM_layers = 8
+metadata/_custom_type_script = "uid://ut2sokhl7u7c"

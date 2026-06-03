@@ -1,0 +1,65 @@
+[gd_resource type="ShaderMaterial" format=3 uid="uid://lp7ajofhmang"]
+
+[ext_resource type="Shader" uid="uid://bncptpdni6rti" path="res://addons/POM clouds/POM_Clouds_shader.tres" id="1_1bgv3"]
+
+[sub_resource type="Gradient" id="Gradient_jo32f"]
+interpolation_mode = 2
+offsets = PackedFloat32Array(0, 0.8163842)
+colors = PackedColorArray(1, 1, 1, 1, 0.29219002, 0.29219005, 0.29218993, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_88axq"]
+gradient = SubResource("Gradient_jo32f")
+width = 100
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_88fnj"]
+noise_type = 3
+frequency = 0.02
+fractal_type = 3
+
+[sub_resource type="NoiseTexture2D" id="NoiseTexture2D_jo32f"]
+width = 500
+height = 500
+noise = SubResource("FastNoiseLite_88fnj")
+seamless = true
+
+[sub_resource type="Gradient" id="Gradient_88fnj"]
+interpolation_mode = 2
+offsets = PackedFloat32Array(0, 0.79577464, 1)
+colors = PackedColorArray(0.7792914, 0.7792914, 0.77929115, 1, 1, 1, 1, 1, 0.82606, 0.82606006, 0.82606, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_jo32f"]
+gradient = SubResource("Gradient_88fnj")
+width = 100
+
+[sub_resource type="Gradient" id="Gradient_88axq"]
+colors = PackedColorArray(1, 1, 1, 1, 0, 0, 0, 1)
+
+[sub_resource type="GradientTexture2D" id="GradientTexture2D_gfo3i"]
+gradient = SubResource("Gradient_88axq")
+fill = 1
+fill_from = Vector2(0.5, 0.5)
+fill_to = Vector2(1, 0.5)
+
+[sub_resource type="Gradient" id="Gradient_gfo3i"]
+interpolation_mode = 2
+offsets = PackedFloat32Array(0.7, 1)
+
+[sub_resource type="GradientTexture1D" id="GradientTexture1D_aivy6"]
+gradient = SubResource("Gradient_gfo3i")
+width = 100
+
+[resource]
+render_priority = 0
+shader = ExtResource("1_1bgv3")
+shader_parameter/layer_gap = 0.03
+shader_parameter/far_cloud_fade_Gradient_2D = SubResource("GradientTexture2D_gfo3i")
+shader_parameter/cloud_vertical_shape_Gradient_1D = SubResource("GradientTexture1D_jo32f")
+shader_parameter/uv_scale = 1.0
+shader_parameter/mesh_scale = 100000.0
+shader_parameter/wind_resistance = 100.0
+shader_parameter/cloud_Noise_texture_2D = SubResource("NoiseTexture2D_jo32f")
+shader_parameter/horizontal_expantion_Gradient_1D = SubResource("GradientTexture1D_aivy6")
+shader_parameter/backlight_Gradient_1D = SubResource("GradientTexture1D_88axq")
+shader_parameter/triplanar_scale = Vector3(1, 1, 1)
+shader_parameter/triplanar_offset = Vector3(0, 0, 0)
+shader_parameter/triplanar_sharpness = 0.5
